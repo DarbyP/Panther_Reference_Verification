@@ -2,8 +2,6 @@
 
 A tool to detect potentially fabricated references in student papers. Developed by Darby Proctor, Ph.D.
 
-![Reference Checker Screenshot](assets/panther_HQ.png)
-
 ## Features
 
 - **Reference Verification**: Checks references against CrossRef, PubMed (journals), Open Library, and Google Books (books)
