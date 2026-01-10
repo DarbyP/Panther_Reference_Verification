@@ -1,0 +1,141 @@
+name: Build macOS DMG (Signed & Notarized)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+          brew install create-dmg
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          
+          # Import certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          
+          # Allow codesign to access keychain
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Build app bundle
+        run: |
+          pyinstaller --noconfirm --onedir --windowed \
+            --name "ReferenceChecker" \
+            --icon "assets/panther_icon.icns" \
+            --add-data "assets:assets" \
+            --add-data "docs:docs" \
+            --osx-bundle-identifier "com.darbyproctor.referencechecker" \
+            reference_checker.py
+
+      - name: Sign app bundle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Sign all frameworks and dylibs first
+          find "dist/ReferenceChecker.app" -name "*.dylib" -o -name "*.so" -o -name "*.framework" | while read lib; do
+            codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" "$lib" || true
+          done
+          
+          # Sign the main executable
+          codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" \
+            "dist/ReferenceChecker.app/Contents/MacOS/ReferenceChecker"
+          
+          # Sign the entire app bundle
+          codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" \
+            --entitlements - --deep "dist/ReferenceChecker.app" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+              <true/>
+              <key>com.apple.security.cs.disable-library-validation</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          
+          # Verify signature
+          codesign --verify --verbose "dist/ReferenceChecker.app"
+
+      - name: Create DMG
+        run: |
+          create-dmg \
+            --volname "Reference Checker" \
+            --volicon "assets/panther_icon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "ReferenceChecker.app" 150 190 \
+            --hide-extension "ReferenceChecker.app" \
+            --app-drop-link 450 190 \
+            "ReferenceChecker-macOS.dmg" \
+            "dist/ReferenceChecker.app"
+
+      - name: Sign DMG
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --force --sign "Developer ID Application: ($APPLE_TEAM_ID)" "ReferenceChecker-macOS.dmg"
+
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Submit for notarization
+          xcrun notarytool submit "ReferenceChecker-macOS.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          
+          # Staple the notarization ticket
+          xcrun stapler staple "ReferenceChecker-macOS.dmg"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReferenceChecker-macOS
+          path: ReferenceChecker-macOS.dmg
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ReferenceChecker-macOS.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
