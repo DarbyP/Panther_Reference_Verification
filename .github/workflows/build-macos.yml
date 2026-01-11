@@ -48,6 +48,11 @@ jobs:
           # Allow codesign to access keychain
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
+          
+          # Find and export the signing identity for later steps
+          SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+          echo "Found signing identity: $SIGNING_IDENTITY"
 
       - name: Build app bundle
         run: |
@@ -60,21 +65,21 @@ jobs:
             reference_checker.py
 
       - name: Sign app bundle
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           # Sign all frameworks and dylibs first
-          find "dist/ReferenceChecker.app" -name "*.dylib" -o -name "*.so" -o -name "*.framework" | while read lib; do
-            codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" "$lib" || true
+          find "dist/ReferenceChecker.app" -name "*.dylib" -o -name "*.so" | while read lib; do
+            codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$lib" || true
           done
           
+          # Sign all .so files in the bundle
+          find "dist/ReferenceChecker.app" -name "*.so" -exec codesign --force --options runtime --sign "$SIGNING_IDENTITY" {} \; || true
+          
           # Sign the main executable
-          codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" \
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" \
             "dist/ReferenceChecker.app/Contents/MacOS/ReferenceChecker"
           
-          # Sign the entire app bundle
-          codesign --force --options runtime --sign "Developer ID Application: ($APPLE_TEAM_ID)" \
-            --entitlements - --deep "dist/ReferenceChecker.app" <<EOF
+          # Create entitlements file
+          cat > entitlements.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -86,6 +91,10 @@ jobs:
           </dict>
           </plist>
           EOF
+          
+          # Sign the entire app bundle
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" \
+            --entitlements entitlements.plist --deep "dist/ReferenceChecker.app"
           
           # Verify signature
           codesign --verify --verbose "dist/ReferenceChecker.app"
@@ -105,10 +114,8 @@ jobs:
             "dist/ReferenceChecker.app"
 
       - name: Sign DMG
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          codesign --force --sign "Developer ID Application: ($APPLE_TEAM_ID)" "ReferenceChecker-macOS.dmg"
+          codesign --force --sign "$SIGNING_IDENTITY" "ReferenceChecker-macOS.dmg"
 
       - name: Notarize DMG
         env:
