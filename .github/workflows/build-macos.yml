@@ -68,9 +68,24 @@ jobs:
             --osx-bundle-identifier "com.darbyproctor.referencechecker" \
             reference_checker.py
           
-          # Update Info.plist with correct version
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "dist/ReferenceChecker.app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "dist/ReferenceChecker.app/Contents/Info.plist"
+          # Update Info.plist with correct version (use Add if key doesn't exist, Set if it does)
+          PLIST="dist/ReferenceChecker.app/Contents/Info.plist"
+          
+          # CFBundleShortVersionString
+          if /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST" 2>/dev/null; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+          else
+            /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
+          fi
+          
+          # CFBundleVersion
+          if /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST" 2>/dev/null; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST"
+          else
+            /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$PLIST"
+          fi
+          
+          echo "Updated Info.plist with version $VERSION"
 
       - name: Sign app bundle
         run: |
