@@ -31,7 +31,7 @@ from PIL import Image, ImageTk
 # VERSION AND UPDATE CONFIGURATION
 # =============================================================================
 VERSION = "1.0.0"
-GITHUB_REPO = "YOUR_USERNAME/reference-checker"  # Update this with your GitHub username
+GITHUB_REPO = "DarbyP/Panther_Reference_Verification"  # Update this with your GitHub username
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 # Colors
