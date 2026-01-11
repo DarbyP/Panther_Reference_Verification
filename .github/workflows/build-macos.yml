@@ -56,6 +56,10 @@ jobs:
 
       - name: Build app bundle
         run: |
+          # Extract version from Python file
+          VERSION=$(grep -o 'VERSION = "[^"]*"' reference_checker.py | cut -d'"' -f2)
+          echo "Building version: $VERSION"
+          
           pyinstaller --noconfirm --onedir --windowed \
             --name "ReferenceChecker" \
             --icon "assets/panther_icon.icns" \
@@ -63,6 +67,10 @@ jobs:
             --add-data "docs:docs" \
             --osx-bundle-identifier "com.darbyproctor.referencechecker" \
             reference_checker.py
+          
+          # Update Info.plist with correct version
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "dist/ReferenceChecker.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "dist/ReferenceChecker.app/Contents/Info.plist"
 
       - name: Sign app bundle
         run: |
@@ -102,7 +110,7 @@ jobs:
       - name: Create DMG
         run: |
           create-dmg \
-            --volname "Reference Checker" \
+            --volname "Panther Reference Verification" \
             --volicon "assets/panther_icon.icns" \
             --window-pos 200 120 \
             --window-size 600 400 \
