@@ -30,7 +30,7 @@ from PIL import Image, ImageTk
 # =============================================================================
 # VERSION AND UPDATE CONFIGURATION
 # =============================================================================
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 GITHUB_REPO = "DarbyP/Panther_Reference_Verification"  # Update this with your GitHub username
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -1296,7 +1296,7 @@ class ReferenceCheckerGUI:
         self.logo_image = None
         
         self.input_folder = tk.StringVar()
-        self.output_file = tk.StringVar(value="reference_report.docx")
+        self.output_file = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Ready")
         self.verified_threshold = tk.StringVar(value="95")
         self.partial_threshold = tk.StringVar(value="70")
@@ -1344,7 +1344,7 @@ class ReferenceCheckerGUI:
     
     def open_user_guide(self):
         """Open the user guide PDF."""
-        guide_path = get_resource_path(os.path.join('docs', 'user_guide.pdf'))
+        guide_path = get_resource_path(os.path.join('docs', 'Panther_Reference_Verification_User_Guide.pdf'))
         if os.path.exists(guide_path):
             webbrowser.open(f'file://{guide_path}')
         else:
