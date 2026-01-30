@@ -3,6 +3,90 @@ Panther Reference Verification
 A tool to detect potentially fabricated references in student papers.
 
 Checks references against CrossRef and PubMed (journals), Open Library and Google Books (books).
+
+⚠️ IMPORTANT: WHAT THIS TOOL DOES AND DOES NOT DO
+===================================================
+
+This tool is a SCREENING AID that helps instructors identify references that may need 
+manual verification. It does NOT definitively prove that a reference is falsified.
+
+✓ WHAT IT DOES:
+- Automatically verifies references against major academic databases
+- Filters out references that are found and verified
+- Flags references that could not be verified for manual review
+- Reduces the number of references instructors need to manually check
+
+✗ WHAT IT DOES NOT DO:
+- Does NOT prove a reference is fabricated (many legitimate reasons for flags)
+- Does NOT replace instructor judgment and manual verification
+- Does NOT check all sources (some journals/books are not indexed)
+
+⚠️ ALL FLAGGED REFERENCES REQUIRE MANUAL VERIFICATION BY THE INSTRUCTOR
+
+Common reasons for legitimate flags:
+• Journal not indexed in CrossRef/PubMed
+• Book not in Open Library/Google Books
+• Student made an honest transcription error (misspelled title, wrong year)
+• Non-English sources
+• Very recent publications not yet indexed
+• Regional or specialized publications
+
+The goal is to REDUCE verification burden, not eliminate it entirely.
+
+PROCESSING FLOW:
+================
+
+1. STYLE DETECTION (detect_citation_style)
+   - Analyzes reference list and in-text citations
+   - Returns: 'APA', 'MLA', or 'UNKNOWN' with confidence %
+   - This determines ALL subsequent processing
+
+2. REFERENCE EXTRACTION & SPLITTING
+   APA Style Guide:
+   - Format: Author, I. N. (Year). Title. Source.
+   - Split by: Year in parentheses at start
+   - Function: split_apa_references()
+   
+   MLA Style Guide:
+   - Format: Author, Full Name. "Title." Container, elements, year.
+   - Split by: "LastName, FirstName." or quoted title
+   - Filters: Page headers ("LastName PageNumber")
+   - Function: split_mla_references()
+
+3. REFERENCE PARSING
+   APA Style Guide:
+   - Author: Everything before (Year)
+   - Year: In parentheses early
+   - Title: After year, before source
+   - Function: parse_apa_reference()
+   
+   MLA Style Guide:
+   - Author: Before first period (if not starting with quote)
+   - Title: Text in quotes
+   - Year: Last 50 chars (end of reference)
+   - Container: Between title and year
+   - Function: parse_mla_reference()
+
+4. CITATION EXTRACTION
+   APA Style Guide:
+   - Parenthetical: (Author, Year)
+   - Narrative: Author (Year)
+   - Function: extract_intext_citations() with citation_style='APA'
+   
+   MLA Style Guide:
+   - Parenthetical: (Author Page) or (Author)
+   - Narrative: Author names from ref list in scholarly contexts
+   - Function: extract_intext_citations() with citation_style='MLA'
+
+5. CITATION-REFERENCE MATCHING
+   - Normalizes author names (preserves order for et al.)
+   - Handles MLA (no year) vs APA (requires year)
+   - Function: match_citations_to_references()
+
+6. VERIFICATION
+   - Checks references against academic databases
+   - Style-agnostic (works on parsed components)
+   - Function: verify_all_references()
 """
 
 import os
@@ -30,7 +114,7 @@ from PIL import Image, ImageTk
 # =============================================================================
 # VERSION AND UPDATE CONFIGURATION
 # =============================================================================
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 GITHUB_REPO = "DarbyP/Panther_Reference_Verification"  # Update this with your GitHub username
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -38,6 +122,7 @@ GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases/late
 FT_CRIMSON = '#770000'
 FT_CRIMSON_RGB = RGBColor(0x77, 0x00, 0x00)
 FT_ORANGE_RGB = RGBColor(0xCC, 0x66, 0x00)
+FT_GREEN_RGB = RGBColor(0x00, 0x66, 0x00)
 FT_WHITE = '#FFFFFF'
 FT_LIGHT_GRAY = '#F5F5F5'
 
@@ -144,6 +229,18 @@ def extract_text_from_pdf(filepath):
     return [p.strip() for p in paragraphs]
 
 
+def extract_text_from_pdf_page(filepath, page_number):
+    """Extract text from a specific page of a PDF file (1-indexed)."""
+    paragraphs = []
+    with pdfplumber.open(filepath) as pdf:
+        if 0 < page_number <= len(pdf.pages):
+            page = pdf.pages[page_number - 1]  # Convert to 0-indexed
+            text = page.extract_text()
+            if text:
+                paragraphs.extend(text.split('\n'))
+    return [p.strip() for p in paragraphs]
+
+
 def extract_student_name(paragraphs):
     """Extract student name from APA title page."""
     first_lines = [p for p in paragraphs if p][:15]
@@ -188,12 +285,25 @@ def ingest_papers(folder_path):
         suffix = filepath.suffix.lower()
         if suffix == '.docx':
             paragraphs = extract_text_from_docx(filepath)
+            student_name = extract_student_name(paragraphs)
         elif suffix == '.pdf':
-            paragraphs = extract_text_from_pdf(filepath)
+            # Check if this is a Turnitin PDF (has "Submission ID" on first page)
+            first_page_text = extract_text_from_pdf_page(filepath, 1)
+            is_turnitin = any('Submission ID' in line for line in first_page_text)
+            
+            if is_turnitin:
+                # For Turnitin PDFs, extract student name from page 3
+                page_3_text = extract_text_from_pdf_page(filepath, 3)
+                student_name = extract_student_name(page_3_text)
+                # Still get all paragraphs for reference extraction
+                paragraphs = extract_text_from_pdf(filepath)
+            else:
+                # Normal PDF processing
+                paragraphs = extract_text_from_pdf(filepath)
+                student_name = extract_student_name(paragraphs)
         else:
             continue
         
-        student_name = extract_student_name(paragraphs)
         code = f"REF_{uuid.uuid4().hex[:6].upper()}"
         
         lookup[code] = {
@@ -206,15 +316,149 @@ def ingest_papers(folder_path):
 
 
 # =============================================================================
-# COMPONENT 2: Reference Section Extraction
+# COMPONENT 1.5: Citation Style Detection  
 # =============================================================================
 
-def find_references_section(paragraphs):
-    """Find and extract the references section."""
-    start_idx = None
+def detect_citation_style(paragraphs):
+    """
+    Detect whether a paper uses APA or MLA citation style.
+    
+    Strategy: Analyze the reference list format (most reliable indicator)
+    - APA: Author, I. N. (Year). Title.
+    - MLA: Author, Full Name. "Title."
+    
+    Returns: (style, confidence_percentage)
+    """
+    # Find the references section
+    ref_section = find_references_section(paragraphs)
+    
+    if not ref_section or len(ref_section) < 2:
+        return 'UNKNOWN', 0
+    
+    score = {'APA': 0, 'MLA': 0}
+    
+    # Check header (if we can find it)
     for i, p in enumerate(paragraphs):
         cleaned = p.strip().lower()
         if re.match(r'^references?\s*$', cleaned):
+            score['APA'] += 2
+            break
+        elif re.match(r'^works\s+cited\s*$', cleaned):
+            score['MLA'] += 3  # Strong signal
+            break
+    
+    # Analyze first 5 reference entries (or fewer if less available)
+    sample_refs = ref_section[:min(5, len(ref_section))]
+    
+    for ref in sample_refs:
+        if len(ref) < 20:  # Skip very short lines
+            continue
+        
+        # APA signatures:
+        # 1. Initials after last name: "Smith, J. A."
+        # 2. Year in parentheses early in entry: "(2020)"
+        # 3. Pattern: Author, X. Y. (YEAR).
+        
+        # Look for initials pattern (one or two capital letters with periods)
+        if re.search(r'[A-Z][a-z]+,\s+[A-Z]\.\s*(?:[A-Z]\.\s*)?\(', ref):
+            score['APA'] += 3
+        
+        # Look for year in parentheses near the start
+        if re.search(r'^[^(]{10,60}\(\d{4}[a-z]?\)', ref):
+            score['APA'] += 2
+        
+        # MLA signatures:
+        # 1. Full first name: "Smith, John" or "Smith, John Andrew"
+        # 2. Title in quotes or italics immediately after author
+        # 3. Year appears later, often near end, no parentheses
+        
+        # Look for full name pattern (capital first name after comma)
+        if re.search(r'[A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\.\s+"', ref):
+            score['MLA'] += 3
+        
+        # Look for full first name without immediate parentheses
+        if re.search(r'[A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\.', ref) and not re.search(r'\(\d{4}\)', ref[:60]):
+            score['MLA'] += 2
+        
+        # Look for title in quotes early in entry (MLA pattern)
+        if re.search(r'^[^"]{10,50}"[^"]{10,}".{20,}\d{4}', ref):
+            score['MLA'] += 2
+    
+    # Also check in-text citation patterns in body (secondary signal)
+    body = extract_paper_body(paragraphs)
+    body_text = ' '.join(body[:100])  # Sample first 100 paragraphs
+    
+    # APA: (Author, Year) with comma
+    apa_citations = len(re.findall(r'\([A-Z][a-z]+(?:\s+et al\.)?,\s*\d{4}\)', body_text))
+    
+    # MLA: (Author Page) or just (Author) - space, no comma before number
+    mla_citations = len(re.findall(r'\([A-Z][a-z]+\s+\d{1,4}(?:-\d{1,4})?\)', body_text))
+    
+    if apa_citations > mla_citations * 2:  # Strong APA signal
+        score['APA'] += 2
+    elif mla_citations > apa_citations:
+        score['MLA'] += 2
+    
+    # Calculate confidence
+    total_score = score['APA'] + score['MLA']
+    
+    if total_score == 0:
+        return 'UNKNOWN', 0
+    
+    if score['APA'] > score['MLA']:
+        confidence = (score['APA'] / total_score) * 100
+        return 'APA', confidence
+    elif score['MLA'] > score['APA']:
+        confidence = (score['MLA'] / total_score) * 100
+        return 'MLA', confidence
+    else:
+        return 'UNKNOWN', 50
+
+
+# =============================================================================
+# COMPONENT 2: Reference Section Extraction
+# =============================================================================
+
+def clean_turnitin_footer(text):
+    """
+    Remove Turnitin footer patterns from reference text.
+    
+    Turnitin adds footers like:
+    - "Page 12 of 12 - AI Writing Submission Submission ID trn:oid:::1:3427731680"
+    - "Page 5 of 12"
+    - Other similar patterns with Submission ID
+    
+    This function is more permissive to catch footers even when spacing is inconsistent.
+    """
+    # Pattern 1: "Page X of Y" followed by anything (most common)
+    # Use \s* instead of \s+ to allow zero or more spaces before "Page"
+    # This catches cases like "file.pdf Page 12" or "file.pdfPage 12" (no space)
+    text = re.sub(r'\s*Page\s+\d+\s+of\s+\d+.*$', '', text, flags=re.IGNORECASE)
+    
+    # Pattern 2: Also remove if "Page X of Y" appears in the middle (not just at end)
+    # This handles cases where multiple references are on one line
+    text = re.sub(r'\s*Page\s+\d+\s+of\s+\d+[^\w]*(?:AI\s+Writing|Submission).*?(?=\s[A-Z][a-z]+,|\s*$)', '', text, flags=re.IGNORECASE)
+    
+    # Pattern 3: "Submission ID" patterns if they somehow appear alone
+    text = re.sub(r'\s*Submission\s+ID\s+[^\s]+.*$', '', text, flags=re.IGNORECASE)
+    
+    # Pattern 4: "AI Writing Submission" if it somehow appears alone
+    text = re.sub(r'\s*AI\s+Writing\s+Submission.*$', '', text, flags=re.IGNORECASE)
+    
+    # Pattern 5: Standalone "Page X of Y -" or "Page X of Y" at the end
+    # More aggressive - removes even partial footer patterns
+    text = re.sub(r'\s*Page\s+\d+\s+of\s+\d+\s*-?\s*$', '', text, flags=re.IGNORECASE)
+    
+    return text.strip()
+
+
+def find_references_section(paragraphs):
+    """Find and extract the references section, filtering out Turnitin footers."""
+    start_idx = None
+    for i, p in enumerate(paragraphs):
+        cleaned = p.strip().lower()
+        # Check for both "References" (APA) and "Works Cited" (MLA)
+        if re.match(r'^references?\s*$', cleaned) or re.match(r'^works\s+cited\s*$', cleaned):
             start_idx = i + 1
             break
     
@@ -228,7 +472,15 @@ def find_references_section(paragraphs):
             end_idx = i
             break
     
-    return [p for p in paragraphs[start_idx:end_idx] if p.strip()]
+    # Extract and clean each paragraph, filtering out Turnitin footers
+    cleaned_refs = []
+    for p in paragraphs[start_idx:end_idx]:
+        if p.strip():
+            cleaned = clean_turnitin_footer(p)
+            if cleaned:  # Only add if there's content left after cleaning
+                cleaned_refs.append(cleaned)
+    
+    return cleaned_refs
 
 
 def extract_references_from_lookup(lookup):
@@ -236,10 +488,16 @@ def extract_references_from_lookup(lookup):
     results = {}
     for code, info in lookup.items():
         ref_section = find_references_section(info['paragraphs'])
+        
+        # Detect citation style for this paper
+        style, confidence = detect_citation_style(info['paragraphs'])
+        
         results[code] = {
             'student_name': info['student_name'],
             'filepath': info['filepath'],
-            'references_text': ref_section
+            'references_text': ref_section,
+            'citation_style': style,
+            'style_confidence': confidence
         }
     return results
 
@@ -253,7 +511,7 @@ def extract_paper_body(paragraphs):
     ref_idx = None
     for i, p in enumerate(paragraphs):
         cleaned = p.strip().lower()
-        if re.match(r'^references?\s*$', cleaned):
+        if re.match(r'^references?\s*$', cleaned) or re.match(r'^works\s+cited\s*$', cleaned):
             ref_idx = i
             break
     
@@ -272,60 +530,139 @@ def extract_paper_body(paragraphs):
     return [p for p in paragraphs[start_idx:ref_idx] if p.strip()]
 
 
-def extract_intext_citations(paper_body):
+def get_reference_last_names(references):
+    """
+    Extract a set of last names from the reference list.
+    Used for MLA narrative citation detection.
+    
+    In MLA format, the last name is the first element before the comma:
+    - "Ball, Lucille" → "Ball"
+    - "Smith, John" → "Smith"
+    - "Pontikes, Elizabeth, et al." → "Pontikes"
+    """
+    last_names = set()
+    for ref in references:
+        authors = ref.get('authors', '')
+        if authors:
+            # In MLA, the last name is everything before the first comma
+            # Handle multiple authors separated by commas after the first author
+            first_author = authors.split(',')[0].strip()
+            
+            # Clean up any remaining punctuation or "and"
+            first_author = re.sub(r'\s+and\s+.*', '', first_author, flags=re.IGNORECASE)
+            first_author = first_author.strip()
+            
+            # Take the first word (the actual last name)
+            words = first_author.split()
+            if words:
+                last_names.add(words[0])
+    
+    return last_names
+
+
+def extract_intext_citations(paper_body, citation_style='APA', reference_last_names=None):
     """
     Extract in-text citations from the paper body.
     Returns a list of (author, year) tuples.
     
-    Handles:
+    Handles both APA and MLA citation styles.
+    
+    For APA:
     - Parenthetical: (Smith, 2020)
     - Narrative: Smith (2020)
     - Multiple authors: (Smith & Jones, 2020) or (Smith et al., 2020)
     - Multiple citations: (Smith, 2020; Jones, 2019)
     - Prefixes: (e.g., Smith, 2020), (see: Smith, 2020), (cf. Jones, 2019)
-    - Organizations: (American Psychological Association, 2017), (National Institutes of Health, 2019)
+    - Organizations: (American Psychological Association, 2017)
+    
+    For MLA:
+    - Parenthetical: (Smith 45) or (Smith)
+    - Narrative: mentions of author names from reference list
     """
     citations = []
     text = ' '.join(paper_body)
     
-    # Pattern for parenthetical citations with OPTIONAL prefixes
-    # Now handles organization names including lowercase connector words (of, the, for, etc.)
-    # Author pattern: Starts with capital word, then optionally more capital words or lowercase connectors
-    author_pattern = r'[A-Z][A-Za-z\-\']+(?:\s+(?:of|the|for|and|in|on|at|to|a|an|from)\s+[A-Z][A-Za-z\-\']+|\s+[A-Z][A-Za-z\-\']+)*'
-    paren_pattern = r'\((?:(?:e\.g\.,|cf\.|see|see e\.g\.,|see for example,?|see also):?\s*)?(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?),?\s+((?:19|20)\d{2}[a-z]?)\)'
-    
-    for match in re.finditer(paren_pattern, text):
-        author = match.group(1)
-        year = match.group(2)
-        citations.append((author, year))
-    
-    # Pattern for multiple citations in one parenthesis
-    multi_paren_pattern = r'\(([^)]+)\)'
-    for match in re.finditer(multi_paren_pattern, text):
-        content = match.group(1)
-        # Only process if it contains semicolons (multiple citations)
-        if ';' in content:
-            # Remove common prefixes first
-            content = re.sub(r'^(?:e\.g\.,|cf\.|see|see e\.g\.,|see for example,?|see also):?\s*', '', content, flags=re.IGNORECASE)
-            parts = content.split(';')
-            for part in parts:
-                # Try to find Author, Year pattern in each part
-                sub_pattern = r'(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?),?\s+((?:19|20)\d{2}[a-z]?)'
-                sub_match = re.search(sub_pattern, part)
-                if sub_match:
-                    author = sub_match.group(1)
-                    year = sub_match.group(2)
-                    citations.append((author, year))
-    
-    # Pattern for narrative citations with organization name support
-    narrative_pattern = r'(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?)\s+\(((?:19|20)\d{2}[a-z]?)\)'
-    
-    for match in re.finditer(narrative_pattern, text):
-        author = match.group(1).strip()
-        year = match.group(2)
-        # Avoid duplicates from patterns that might overlap
-        if (author, year) not in citations:
+    if citation_style == 'APA':
+        # Pattern for parenthetical citations with OPTIONAL prefixes
+        # Now handles organization names including lowercase connector words (of, the, for, etc.)
+        # Author pattern: Starts with capital word, then optionally more capital words or lowercase connectors
+        author_pattern = r'[A-Z][A-Za-z\-\']+(?:\s+(?:of|the|for|and|in|on|at|to|a|an|from)\s+[A-Z][A-Za-z\-\']+|\s+[A-Z][A-Za-z\-\']+)*'
+        paren_pattern = r'\((?:(?:e\.g\.,|cf\.|see|see e\.g\.,|see for example,?|see also):?\s*)?(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?),?\s+((?:19|20)\d{2}[a-z]?)\)'
+        
+        for match in re.finditer(paren_pattern, text):
+            author = match.group(1)
+            year = match.group(2)
             citations.append((author, year))
+        
+        # Pattern for multiple citations in one parenthesis
+        multi_paren_pattern = r'\(([^)]+)\)'
+        for match in re.finditer(multi_paren_pattern, text):
+            content = match.group(1)
+            # Only process if it contains semicolons (multiple citations)
+            if ';' in content:
+                # Remove common prefixes first
+                content = re.sub(r'^(?:e\.g\.,|cf\.|see|see e\.g\.,|see for example,?|see also):?\s*', '', content, flags=re.IGNORECASE)
+                parts = content.split(';')
+                for part in parts:
+                    # Try to find Author, Year pattern in each part
+                    sub_pattern = r'(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?),?\s+((?:19|20)\d{2}[a-z]?)'
+                    sub_match = re.search(sub_pattern, part)
+                    if sub_match:
+                        author = sub_match.group(1)
+                        year = sub_match.group(2)
+                        citations.append((author, year))
+        
+        # Pattern for narrative citations with organization name support
+        narrative_pattern = r'(' + author_pattern + r'(?:\s+et al\.|\s+(?:and|&)\s+(?:colleagues|co-workers)|\s+(?:&|and)\s+' + author_pattern + r')?)\s+\(((?:19|20)\d{2}[a-z]?)\)'
+        
+        for match in re.finditer(narrative_pattern, text):
+            author = match.group(1).strip()
+            year = match.group(2)
+            # Avoid duplicates from patterns that might overlap
+            if (author, year) not in citations:
+                citations.append((author, year))
+    
+    elif citation_style == 'MLA':
+        # MLA parenthetical: (Author Page) or (Author)
+        author_pattern = r'[A-Z][A-Za-z\-\']+'
+        
+        # Pattern 1: (Author Page)
+        paren_with_page = r'\((' + author_pattern + r'(?:\s+et al\.)?)\s+(\d{1,4}(?:-\d{1,4})?)\)'
+        for match in re.finditer(paren_with_page, text):
+            author = match.group(1)
+            # In MLA, we don't have year in citation, set to None
+            citations.append((author, None))
+        
+        # Pattern 2: (Author) - no page
+        paren_no_page = r'\((' + author_pattern + r'(?:\s+et al\.)?)\)'
+        for match in re.finditer(paren_no_page, text):
+            author = match.group(1)
+            # Avoid double-counting if already captured with page
+            if not any(c[0] == author for c in citations):
+                citations.append((author, None))
+        
+        # Pattern 3: Narrative citations - author names from reference list appearing in text
+        if reference_last_names:
+            for last_name in reference_last_names:
+                # Common narrative patterns in MLA
+                patterns = [
+                    rf'\b{last_name}\s+(?:argues|states|suggests|notes|writes|demonstrates|shows|finds|claims|asserts|observes|explains|contends|believes|maintains)',
+                    rf'\b{last_name}\'s\s+(?:study|research|work|article|book|essay|analysis|findings|argument|theory)',
+                    rf'(?:according to|as)\s+{last_name}\b',
+                ]
+                
+                for pattern in patterns:
+                    matches = re.finditer(pattern, text, re.IGNORECASE)
+                    for match in matches:
+                        # Try to find a year nearby (within 50 chars) for better matching
+                        context = text[max(0, match.start()-50):match.end()+50]
+                        year_match = re.search(r'\b(19|20)\d{2}\b', context)
+                        year = year_match.group(0) if year_match else None
+                        
+                        # Avoid duplicates
+                        if not any(c[0].lower() == last_name.lower() for c in citations):
+                            citations.append((last_name, year))
+                            break  # Only add once per author
     
     return citations
 
@@ -334,13 +671,17 @@ def extract_reference_authors_years(references):
     """
     Extract author names and years from parsed references.
     Returns a list of (authors_text, year) tuples.
+    
+    For MLA: Includes references even if year is missing (year will be empty string).
+    For APA: Requires both author and year.
     """
     ref_citations = []
     for ref in references:
         authors = ref.get('authors', '')
         year = ref.get('year', '')
-        if authors and year:
-            ref_citations.append((authors, year))
+        # Include if we have authors (year optional for MLA)
+        if authors:
+            ref_citations.append((authors, year if year else ''))
     return ref_citations
 
 
@@ -414,10 +755,11 @@ def extract_last_name_from_citation(citation_author):
 def normalize_year(year):
     """
     Normalize year by removing letter suffixes (2015a -> 2015).
+    Returns None for empty/missing years (MLA style).
     """
-    if year:
+    if year and str(year).strip():
         return re.sub(r'[a-z]$', '', str(year))
-    return year
+    return None
 
 
 def match_citations_to_references(intext_citations, reference_citations):
@@ -452,19 +794,35 @@ def match_citations_to_references(intext_citations, reference_citations):
     for cite_author, cite_year in intext_citations:
         # Normalize the citation author (already just last names)
         norm_cite = extract_last_name_from_citation(cite_author)
-        norm_year = normalize_year(cite_year)
+        norm_year = normalize_year(cite_year) if cite_year else None
         first_last_name = norm_cite.split()[0] if norm_cite else ''
         
-        # Try exact match first (all authors)
-        if (norm_cite, norm_year) in ref_lookup:
-            # Mark all matching references as cited
-            for ref_authors, ref_year in ref_lookup[(norm_cite, norm_year)]:
-                cited_refs.add((ref_authors, ref_year))
-        # Try first author only (for et al.)
-        elif (first_last_name, norm_year) in ref_lookup:
-            for ref_authors, ref_year in ref_lookup[(first_last_name, norm_year)]:
-                cited_refs.add((ref_authors, ref_year))
+        found = False
+        
+        # For MLA (no year in citation), try to match just by author
+        if norm_year is None:
+            # Look for any reference with this author
+            for (ref_author, ref_year), original_refs in ref_lookup.items():
+                if norm_cite == ref_author or norm_cite == ref_author.split()[0]:
+                    for orig_auth, orig_year in original_refs:
+                        cited_refs.add((orig_auth, orig_year))
+                    found = True
+                    break
         else:
+            # APA style - match by author and year
+            # Try exact match first (all authors)
+            if (norm_cite, norm_year) in ref_lookup:
+                # Mark all matching references as cited
+                for ref_authors, ref_year in ref_lookup[(norm_cite, norm_year)]:
+                    cited_refs.add((ref_authors, ref_year))
+                found = True
+            # Try first author only (for et al.)
+            elif (first_last_name, norm_year) in ref_lookup:
+                for ref_authors, ref_year in ref_lookup[(first_last_name, norm_year)]:
+                    cited_refs.add((ref_authors, ref_year))
+                found = True
+        
+        if not found:
             # No match found
             missing_refs.append((cite_author, cite_year))
     
@@ -495,28 +853,44 @@ def check_citation_matching(lookup):
     for code, info in lookup.items():
         paragraphs = info['paragraphs']
         
+        # Detect citation style
+        style, confidence = detect_citation_style(paragraphs)
+        
         # Extract paper body and references section
         paper_body = extract_paper_body(paragraphs)
         ref_section = find_references_section(paragraphs)
         
-        # Extract in-text citations
-        intext_citations = extract_intext_citations(paper_body)
+        if not ref_section:
+            results[code] = {
+                'uncited_refs': [],
+                'missing_refs': [],
+                'total_citations': 0,
+                'total_references': 0,
+                'has_issues': False
+            }
+            continue
         
         # Split and parse references
-        individual_refs = split_references(ref_section)
-        parsed_refs = [parse_reference(ref) for ref in individual_refs]
+        individual_refs = split_references(ref_section, citation_style=style)
+        parsed_refs = [parse_reference(ref, citation_style=style) for ref in individual_refs]
+        
+        # Get reference last names for MLA narrative detection
+        reference_last_names = get_reference_last_names(parsed_refs)
+        
+        # Extract in-text citations with style-appropriate detection
+        intext_citations = extract_intext_citations(paper_body, citation_style=style,
+                                                     reference_last_names=reference_last_names)
+        
         reference_citations = extract_reference_authors_years(parsed_refs)
         
         # Match citations to references
         uncited_refs, missing_refs = match_citations_to_references(intext_citations, reference_citations)
         
         results[code] = {
-            'student_name': info['student_name'],
-            'filepath': info['filepath'],
-            'intext_count': len(set(intext_citations)),  # Unique citations
-            'reference_count': len(reference_citations),
             'uncited_refs': uncited_refs,
             'missing_refs': missing_refs,
+            'total_citations': len(intext_citations),
+            'total_references': len(reference_citations),
             'has_issues': len(uncited_refs) > 0 or len(missing_refs) > 0
         }
     
@@ -527,8 +901,182 @@ def check_citation_matching(lookup):
 # COMPONENT 3: Individual Reference Splitting
 # =============================================================================
 
-def split_references(references_text):
-    """Split references section into individual entries."""
+def split_references(references_text, citation_style='APA'):
+    """
+    Split references section into individual entries.
+    Uses style-appropriate logic.
+    """
+    if citation_style == 'MLA':
+        return split_mla_references(references_text)
+    else:
+        return split_apa_references(references_text)
+
+
+def split_mla_references(references_text):
+    """
+    Split MLA references into individual entries.
+    
+    MLA Style Guide:
+    - References start with "LastName, FirstName." or "LastName, First, et al."
+    - Multiple authors: "LastName, FirstName, and FirstName LastName."
+    - Can also start with "Title" if no author
+    - Sections separated by periods
+    - Year typically at end
+    - Skip page headers: "LastName PageNumber"
+    - Detects new references that start mid-line after URLs
+    - Prevents splitting on middle initials (e.g., "Robert G.")
+    """
+    if not references_text:
+        return []
+    
+    references = []
+    current_ref = []
+    
+    for line in references_text:
+        # Check for hanging indent BEFORE stripping
+        # MLA uses hanging indents: first line is left-justified, continuation lines are indented
+        is_indented = line.startswith(' ') or line.startswith('\t')
+        
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Skip MLA page headers: "LastName PageNumber"
+        if re.match(r'^[A-Z][a-z]+\s+\d+$', line):
+            continue
+        
+        # If line is indented (hanging indent), it's a continuation of the current reference
+        if is_indented and current_ref:
+            current_ref.append(line)
+            continue
+        
+        # Check if line contains a new reference starting mid-line
+        # Pattern: URL/period followed by space and new author pattern
+        # Example: "...scu.edu/vol12/iss1/7/. McCarthy, Joseph. ..."
+        # Look for: end of URL (with domain OR file extension) OR just period + space + author pattern
+        # BUT: Don't split on middle initials (single capital letter + period)
+        # Note: [a-zA-Z] allows for names with internal capitals like McCarthy, McDonald, O'Brien
+        # Recognizes both domain endings (.com/, .edu/) and file extensions (.htm, .html, .pdf, .asp, etc.)
+        mid_line_candidates = list(re.finditer(r'(\.(?:com|org|edu|gov|net)/[^\s]*\.?|\.(?:htm|html|pdf|asp|aspx|php|jsp)\s*\.?|\.)\s+([A-Z][a-zA-Z]{2,},\s+[A-Z][a-zA-Z]{2,})', line))
+        
+        split_performed = False
+        for match in mid_line_candidates:
+            split_point = match.start(2)
+            
+            # Check if the period is part of a middle initial
+            # Look back 2-4 characters to see if we have " X." pattern (middle initial)
+            if split_point >= 3:
+                before_split = line[max(0, split_point-4):split_point]
+                # Pattern: space + single capital + period (middle initial)
+                if re.search(r'\s[A-Z]\.\s*$', before_split):
+                    # This is a middle initial, don't split here
+                    continue
+            
+            # Only split if the "before" part is substantial (> 40 chars)
+            # This avoids splitting cases like "Ball, Lucille. Love, Lucy." where Love, Lucy is a book title
+            # But still splits "...long URL... Author, Name." where it's two merged references
+            before = line[:split_point].strip()
+            if len(before) <= 40:
+                continue
+            
+            # Found a valid split point - split the line
+            after = line[split_point:].strip()
+            
+            if before and current_ref:
+                current_ref.append(before)
+                # Save current reference
+                ref_text = ' '.join(current_ref)
+                if len(ref_text) > 20:
+                    references.append(ref_text)
+                # Start new reference with the part after split
+                current_ref = [after]
+            elif before:
+                # First reference on the line - save even if short (legitimate author names can be < 20 chars)
+                # E.g., "Ball, Lucille." is only 14 characters but is a valid complete author line
+                references.append(before)
+                current_ref = [after]
+            else:
+                # Just start with the after part
+                current_ref = [after]
+            
+            split_performed = True
+            break
+        
+        if split_performed:
+            continue
+        
+        is_new_ref = False
+        if current_ref:
+            # Strategy: Check if PREVIOUS reference looks complete, then check if CURRENT line
+            # could plausibly start a new reference. This is more flexible than hard-coded patterns.
+            
+            # First, check if previous reference looks complete
+            last_line = current_ref[-1] if current_ref else ""
+            prev_looks_complete = (
+                re.search(r'\b[12]\d{3}\s*\.?\s*$', last_line) or  # ends with year
+                re.search(r'pp?\.\s*\d+[\d\s–-]*\.?\s*$', last_line) or  # ends with page numbers
+                re.search(r'(?:com|org|edu|gov|net)/[^\s]*\.?\s*$', last_line) or  # ends with URL
+                re.search(r'\.(?:htm|html|pdf|asp|aspx|php|jsp)\.?\s*$', last_line) or  # ends with file extension
+                re.search(r'Accessed\s+\d+\s+\w+\.?\s+\d{4}\.?\s*$', last_line) or  # ends with access date
+                re.search(r'vol\.\s*\d+.*\d+\.?\s*$', last_line) or  # ends with volume info
+                re.search(r'\d+\s+ed\.?\s*$', last_line) or  # ends with edition
+                re.search(r'[a-zA-Z0-9\-/]{3,}\.\s*$', last_line)  # ends with word/URL segment + period (allows hyphens, numbers, slashes for URLs)
+            )
+            
+            # Now check if current line could plausibly start a reference
+            # Pattern 1: Starts with opening quote (title-first, no author)
+            if re.match(r'^["\u201c]', line):
+                is_new_ref = True
+            
+            # Pattern 2: Author patterns (has comma in the right place)
+            # "LastName, FirstName" or "LastName, FirstName, et al." or "LastName, FirstName, and..."
+            # Allow hyphens and apostrophes in names: O'Brien, McDonald-Smith, Kirshenblatt-Gimblett
+            elif re.match(r'^[A-Z][a-zA-Z\-\']+,\s+[A-Z]', line):
+                # Special case: "United States, Congress" needs completeness check
+                if re.match(r'^United States,', line):
+                    is_new_ref = prev_looks_complete
+                # Special case: "States, Congress" is part of "United States"
+                elif re.match(r'^States,', line):
+                    is_new_ref = False
+                # All other "LastName, FirstName" patterns
+                else:
+                    is_new_ref = prev_looks_complete
+            
+            # Pattern 3: Title-first references (multi-word titles OR single-word titles with period)
+            # Multi-word: "The Red Menace", "A Collection of"
+            # Single-word: "Requiem." or "Starry" (followed by more text)
+            # This catches films, artworks, books without authors, etc.
+            elif re.match(r'^[A-Z][a-zA-Z]*\s+[A-Z]', line) or re.match(r'^[A-Z][a-zA-Z]+\.\s+[A-Z]', line):
+                is_new_ref = prev_looks_complete
+            
+            # If none of the above patterns match, it's a continuation
+        
+        if is_new_ref and current_ref:
+            ref_text = ' '.join(current_ref)
+            if len(ref_text) > 20:
+                references.append(ref_text)
+            current_ref = [line]
+        else:
+            current_ref.append(line)
+    
+    if current_ref:
+        ref_text = ' '.join(current_ref)
+        if len(ref_text) > 20:
+            references.append(ref_text)
+    
+    return references
+
+
+def split_apa_references(references_text):
+    """
+    Split APA references into individual entries.
+    
+    APA Style Guide:
+    - References start with "Author, I. N. (Year)."
+    - Year in parentheses early in reference
+    - Initials, not full first names
+    - Handles cases where URL ends with / and next reference starts on same line
+    """
     if not references_text:
         return []
     
@@ -540,12 +1088,61 @@ def split_references(references_text):
         if not line:
             continue
         
+        # Check if line contains a new reference starting mid-line
+        # Pattern: URL ending with / followed by space and APA author pattern
+        # Example: "...PMC7450866/ Author, I. N. (2020)..."
+        # APA author pattern: "LastName, I." or "LastName, I. N."
+        mid_line_candidates = list(re.finditer(r'(/)\s+([A-Z][a-zA-Z\-\']+,\s+[A-Z]\.(?:\s+[A-Z]\.)?)', line))
+        
+        split_performed = False
+        for match in mid_line_candidates:
+            split_point = match.start(2)
+            
+            # Only split if the "before" part is substantial (> 40 chars)
+            # This avoids splitting legitimate references that happen to have "/ Author"
+            before = line[:split_point].strip()
+            if len(before) <= 40:
+                continue
+            
+            # Check if the after part looks like an APA reference (has year in parentheses)
+            after = line[split_point:].strip()
+            if not re.search(r'\(\d{4}[a-z]?\)', after[:100]):
+                continue
+            
+            # Found a valid split point - split the line
+            if before and current_ref:
+                current_ref.append(before)
+                # Save current reference
+                ref_text = ' '.join(current_ref)
+                if len(ref_text) > 20:
+                    references.append(ref_text)
+                # Start new reference with the part after split
+                current_ref = [after]
+            elif before:
+                # First reference on the line
+                if len(before) > 20:
+                    references.append(before)
+                current_ref = [after]
+            else:
+                # Just start with the after part
+                current_ref = [after]
+            
+            split_performed = True
+            break
+        
+        if split_performed:
+            continue
+        
         is_new_ref = False
         if current_ref:
             if re.match(r'^[A-Z]', line):
                 first_part = line[:150]
+                
+                # APA patterns for new reference:
+                # 1. Year in parentheses: "(2020)"
                 if re.search(r'\(\d{4}[a-z]?\)', first_part):
                     is_new_ref = True
+                # 2. Year with comma/period early: "2020." or "2020,"
                 elif re.search(r'\b(19|20)\d{2}\b', first_part) and re.search(r'[,\.]', first_part[:50]):
                     is_new_ref = True
         
@@ -566,15 +1163,18 @@ def split_references(references_text):
 
 
 def split_references_from_results(results):
-    """Split references for all papers."""
+    """Split references for all papers using style-appropriate logic."""
     output = {}
     for code, info in results.items():
-        individual_refs = split_references(info['references_text'])
+        citation_style = info.get('citation_style', 'APA')
+        individual_refs = split_references(info['references_text'], citation_style=citation_style)
         numbered_refs = [{'ref_num': i, 'text': ref} for i, ref in enumerate(individual_refs, 1)]
         output[code] = {
             'student_name': info['student_name'],
             'filepath': info['filepath'],
-            'references': numbered_refs
+            'references': numbered_refs,
+            'citation_style': citation_style,
+            'style_confidence': info.get('style_confidence', 0)
         }
     return output
 
@@ -583,7 +1183,105 @@ def split_references_from_results(results):
 # COMPONENT 4: Reference Parsing
 # =============================================================================
 
-def parse_reference(ref_text):
+def parse_reference(ref_text, citation_style='APA'):
+    """
+    Parse a reference into components.
+    Handles both APA and MLA styles.
+    
+    APA: Author, I. N. (Year). Title. Source.
+    MLA: Author, Full Name. "Title." Container, elements, year.
+    """
+    if citation_style == 'MLA':
+        return parse_mla_reference(ref_text)
+    else:
+        return parse_apa_reference(ref_text)
+
+
+def parse_mla_reference(ref_text):
+    """
+    Parse an MLA reference into components.
+    
+    MLA Structure:
+    1. Author. (or starts with "Title" if no author)
+    2. "Title of Source."
+    3. Container with comma-separated elements, ending with year.
+    """
+    result = {
+        'raw': ref_text,
+        'authors': None,
+        'year': None,
+        'title': None,
+        'source': None,
+        'doi': None,
+        'ref_type': 'other'
+    }
+    
+    text_lower = ref_text.lower()
+    
+    # Detect reference type (MLA-specific patterns)
+    # Check journal indicators FIRST (before generic http check)
+    if re.search(r'vol\.\s*\d+', text_lower) or re.search(r',\s*no\.\s*\d+', text_lower) or re.search(r'pp\.\s*\d+', text_lower):
+        result['ref_type'] = 'journal'
+    # DOI links are journals, not websites
+    elif 'doi.org' in text_lower:
+        result['ref_type'] = 'journal'
+    # Now check for generic websites
+    elif 'www.' in text_lower or 'http' in text_lower:
+        result['ref_type'] = 'website'
+    # Check for book indicators
+    elif any(pub in text_lower for pub in ['press', 'publisher', 'publishing', 'books']):
+        result['ref_type'] = 'book'
+    
+    # Extract DOI if present
+    doi_match = re.search(r'(10\.\d{4,}/[^\s]+)', ref_text)
+    if doi_match:
+        result['doi'] = doi_match.group(1).rstrip('.,')
+    
+    # MLA structure: Split by periods to find major sections
+    # Be careful with periods in titles (in quotes) and abbreviations
+    
+    # 1. Extract author (everything before first period, if it looks like a name)
+    # Pattern: "LastName, FirstName." or starts with quote (no author)
+    if ref_text.startswith('"') or ref_text.startswith('"'):
+        # No author - starts with title
+        result['authors'] = ''
+    else:
+        # Look for author pattern: "LastName, FirstName" followed by period
+        author_match = re.match(r'^([^"]+?)\.\s+["\"]', ref_text)
+        if author_match:
+            result['authors'] = author_match.group(1).strip()
+        else:
+            # Fallback: take everything before first period
+            first_period = ref_text.find('.')
+            if first_period > 0 and first_period < 100:  # Reasonable author length
+                result['authors'] = ref_text[:first_period].strip()
+    
+    # 2. Extract title (in quotes)
+    title_match = re.search(r'["\u201c]([^"\u201d]+)["\u201d]', ref_text)
+    if title_match:
+        result['title'] = title_match.group(1).strip()
+    
+    # 3. Extract year (usually at the end, 4 digits)
+    # Look for year in last 50 characters
+    year_match = re.search(r'\b(19|20)\d{2}\b', ref_text[-50:])
+    if year_match:
+        result['year'] = year_match.group(0)
+    
+    # 4. Extract source/container (after title, before year)
+    if title_match and result['year']:
+        # Everything between title and year
+        after_title = ref_text[title_match.end():].strip()
+        year_pos = after_title.rfind(result['year'])
+        if year_pos > 0:
+            result['source'] = after_title[:year_pos].strip().rstrip(',.')
+    elif title_match:
+        # Just take what's after title
+        result['source'] = ref_text[title_match.end():].strip().rstrip(',.')
+    
+    return result
+
+
+def parse_apa_reference(ref_text):
     """Parse an APA reference into components."""
     result = {
         'raw': ref_text,
@@ -662,15 +1360,18 @@ def parse_all_references(split_results):
     """Parse all references from split results."""
     output = {}
     for code, info in split_results.items():
+        citation_style = info.get('citation_style', 'APA')
         parsed_refs = []
         for ref in info['references']:
-            parsed = parse_reference(ref['text'])
+            parsed = parse_reference(ref['text'], citation_style=citation_style)
             parsed['ref_num'] = ref['ref_num']
             parsed_refs.append(parsed)
         output[code] = {
             'student_name': info['student_name'],
             'filepath': info['filepath'],
-            'references': parsed_refs
+            'references': parsed_refs,
+            'citation_style': citation_style,
+            'style_confidence': info.get('style_confidence', 0)
         }
     return output
 
@@ -894,11 +1595,13 @@ def search_google_books(title, author=None):
         return {'found': False, 'matches': [], 'error': str(e)}
 
 
-def verify_reference(ref, verified_threshold=0.95, partial_threshold=0.70):
+def verify_reference(ref, verified_threshold=0.95, partial_threshold=0.70, ignore_websites=False):
     """Verify a single reference."""
     ref_type = ref.get('ref_type', 'other')
     
     if ref_type == 'website':
+        if ignore_websites:
+            return {'status': 'website_skipped', 'message': 'Website skipped per settings', 'crossref_data': None}
         return {'status': 'website_manual_verify', 'message': 'Website detected - verify manually', 'crossref_data': None}
     
     if ref_type in ('book', 'chapter'):
@@ -970,7 +1673,7 @@ def verify_reference(ref, verified_threshold=0.95, partial_threshold=0.70):
     return {'status': 'partial_match', 'message': 'Could not parse enough information', 'crossref_data': None}
 
 
-def verify_all_references(parsed_results, delay=0.3, verified_threshold=0.95, partial_threshold=0.70, ignore_books=False):
+def verify_all_references(parsed_results, delay=0.3, verified_threshold=0.95, partial_threshold=0.70, ignore_books=False, ignore_websites=False):
     """Verify all references."""
     output = {}
     for code, info in parsed_results.items():
@@ -984,14 +1687,16 @@ def verify_all_references(parsed_results, delay=0.3, verified_threshold=0.95, pa
                     'crossref_data': None
                 }
             else:
-                verification = verify_reference(ref, verified_threshold, partial_threshold)
+                verification = verify_reference(ref, verified_threshold, partial_threshold, ignore_websites)
                 ref['verification'] = verification
                 time.sleep(delay)
             verified_refs.append(ref)
         output[code] = {
             'student_name': info['student_name'],
             'filepath': info['filepath'],
-            'references': verified_refs
+            'references': verified_refs,
+            'citation_style': info.get('citation_style', 'UNKNOWN'),
+            'style_confidence': info.get('style_confidence', 0)
         }
     return output
 
@@ -1000,7 +1705,7 @@ def verify_all_references(parsed_results, delay=0.3, verified_threshold=0.95, pa
 # COMPONENT 6: Report Generation
 # =============================================================================
 
-def generate_report(verified_results, output_path, verified_threshold=95, partial_threshold=70, ignore_books=False, citation_results=None):
+def generate_report(verified_results, output_path, verified_threshold=95, partial_threshold=70, ignore_books=False, ignore_websites=False, citation_results=None):
     """Generate a DOCX report."""
     doc = DocxDocument()
     
@@ -1031,13 +1736,14 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
             elif status == 'doi_mismatch': stats['doi_mismatch'] += 1
             elif status == 'book_manual_verify': stats['book_manual'] += 1
             elif status == 'website_manual_verify': stats['website_manual'] += 1
+            elif status == 'website_skipped': stats['skipped'] += 1
             elif status == 'skipped': stats['skipped'] += 1
     
     # Calculate citation matching stats if available
     if citation_results:
         for code, cite_info in citation_results.items():
-            stats['citation_total_citations'] += cite_info['intext_count']
-            stats['citation_total_references'] += cite_info['reference_count']
+            stats['citation_total_citations'] += cite_info['total_citations']
+            stats['citation_total_references'] += cite_info['total_references']
             stats['citation_uncited'] += len(cite_info['uncited_refs'])
             stats['citation_missing'] += len(cite_info['missing_refs'])
     
@@ -1053,12 +1759,17 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
         ('DOI Mismatch', str(stats['doi_mismatch']), FT_CRIMSON_RGB if stats['doi_mismatch'] > 0 else None),
     ]
     
-    if ignore_books:
-        summary_data.append(('Books/Chapters (Skipped)', str(stats['skipped']), None))
+    if ignore_books and ignore_websites:
+        summary_data.append(('Books & Websites (Skipped)', str(stats['skipped']), None))
+    elif ignore_books:
+        summary_data.append(('Books (Skipped)', str(stats['skipped']), None))
+        summary_data.append(('Websites (Manual)', str(stats['website_manual']), None))
+    elif ignore_websites:
+        summary_data.append(('Books (Manual)', str(stats['book_manual']), None))
+        summary_data.append(('Websites (Skipped)', str(stats['skipped']), None))
     else:
         summary_data.append(('Book/Chapter (Manual)', str(stats['book_manual']), None))
-    
-    summary_data.append(('Website (Manual)', str(stats['website_manual']), None))
+        summary_data.append(('Website (Manual)', str(stats['website_manual']), None))
     
     # Add citation matching stats if available
     if citation_results:
@@ -1104,11 +1815,17 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
         ('Partial Match', f'Similar reference found ({partial_threshold}-{verified_threshold}% match).'),
         ('DOI Mismatch', 'DOI link resolves to a different paper than cited.'),
     ]
-    if ignore_books:
+    if ignore_books and ignore_websites:
+        legend_items.append(('Skipped', 'Book/chapter/website skipped per settings.'))
+    elif ignore_books:
         legend_items.append(('Skipped', 'Book/chapter skipped per settings.'))
+        legend_items.append(('Website (Manual)', 'Website source - requires manual verification.'))
+    elif ignore_websites:
+        legend_items.append(('Book/Chapter (Manual)', 'Book or chapter - requires manual verification.'))
+        legend_items.append(('Skipped', 'Website skipped per settings.'))
     else:
         legend_items.append(('Book/Chapter (Manual)', 'Book or chapter - requires manual verification.'))
-    legend_items.append(('Website (Manual)', 'Website source - requires manual verification.'))
+        legend_items.append(('Website (Manual)', 'Website source - requires manual verification.'))
     
     for term, definition in legend_items:
         para = doc.add_paragraph()
@@ -1123,6 +1840,30 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
         student_heading = doc.add_heading(f'{info["student_name"]}', level=2)
         student_heading.runs[0].font.color.rgb = FT_CRIMSON_RGB
         
+        # Add citation style detection info
+        citation_style = info.get('citation_style', 'UNKNOWN')
+        style_confidence = info.get('style_confidence', 0)
+        
+        style_para = doc.add_paragraph()
+        style_para.add_run('Detected Style: ').bold = True
+        style_para.add_run(f'{citation_style}  ')
+        style_para.add_run('Confidence: ').bold = True
+        confidence_run = style_para.add_run(f'{style_confidence:.0f}%')
+        
+        # Color code confidence
+        if style_confidence >= 90:
+            confidence_run.font.color.rgb = FT_GREEN_RGB
+        elif style_confidence >= 70:
+            confidence_run.font.color.rgb = FT_ORANGE_RGB
+        else:
+            confidence_run.font.color.rgb = FT_CRIMSON_RGB
+        
+        if style_confidence < 70 and citation_style != 'UNKNOWN':
+            warning_para = doc.add_paragraph()
+            warning_run = warning_para.add_run('⚠ Low confidence - results may be inaccurate. Consider manually verifying style.')
+            warning_run.font.color.rgb = FT_CRIMSON_RGB
+            warning_run.font.size = Pt(10)
+        
         refs = info['references']
         statuses = [r['verification']['status'] for r in refs]
         
@@ -1134,11 +1875,17 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
             f"Partial: {statuses.count('partial_match')}",
             f"DOI Mismatch: {statuses.count('doi_mismatch')}",
         ]
-        if ignore_books:
+        if ignore_books and ignore_websites:
+            summary_parts.append(f"Skipped: {statuses.count('skipped') + statuses.count('website_skipped')}")
+        elif ignore_books:
             summary_parts.append(f"Skipped: {statuses.count('skipped')}")
+            summary_parts.append(f"Website: {statuses.count('website_manual_verify')}")
+        elif ignore_websites:
+            summary_parts.append(f"Book: {statuses.count('book_manual_verify')}")
+            summary_parts.append(f"Skipped: {statuses.count('website_skipped')}")
         else:
             summary_parts.append(f"Book: {statuses.count('book_manual_verify')}")
-        summary_parts.append(f"Website: {statuses.count('website_manual_verify')}")
+            summary_parts.append(f"Website: {statuses.count('website_manual_verify')}")
         
         summary_para = doc.add_paragraph(" | ".join(summary_parts))
         summary_para.runs[0].font.size = Pt(10)
@@ -1150,8 +1897,8 @@ def generate_report(verified_results, output_path, verified_threshold=95, partia
             doc.add_heading('Citation-Reference Matching', level=3)
             
             cite_summary_para = doc.add_paragraph()
-            cite_summary_para.add_run(f"In-text citations found: {cite_info['intext_count']} | ")
-            cite_summary_para.add_run(f"References in list: {cite_info['reference_count']}")
+            cite_summary_para.add_run(f"In-text citations found: {cite_info['total_citations']} | ")
+            cite_summary_para.add_run(f"References in list: {cite_info['total_references']}")
             cite_summary_para.runs[0].font.size = Pt(10)
             
             # Report uncited references
@@ -1301,6 +2048,7 @@ class ReferenceCheckerGUI:
         self.verified_threshold = tk.StringVar(value="95")
         self.partial_threshold = tk.StringVar(value="70")
         self.ignore_books = tk.BooleanVar(value=False)
+        self.ignore_websites = tk.BooleanVar(value=False)
         self.skip_citation_check = tk.BooleanVar(value=False)  # Default: do citation checking
         self.is_running = False
         
@@ -1440,13 +2188,35 @@ class ReferenceCheckerGUI:
         tk.Label(title_frame, text="Developed by Darby Proctor, Ph.D.",
                  font=('Helvetica', 9), fg='#666666', bg=FT_WHITE, anchor='w').pack(anchor=tk.W)
         
+        # Important disclaimer box
+        disclaimer_border = tk.Frame(main_frame, bg='#CC6600', padx=2, pady=2)
+        disclaimer_border.pack(fill=tk.X, pady=(0, 20))
+        disclaimer_frame = tk.Frame(disclaimer_border, bg='#FFF8DC', padx=15, pady=18)
+        disclaimer_frame.pack(fill=tk.X)
+        
+        # Warning icon and title
+        warning_header = tk.Frame(disclaimer_frame, bg='#FFF8DC')
+        warning_header.pack(fill=tk.X)
+        tk.Label(warning_header, text="⚠️", font=('Helvetica', 16), bg='#FFF8DC').pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(warning_header, text="IMPORTANT: This is a Screening Tool", 
+                 font=('Helvetica', 12, 'bold'), fg=FT_CRIMSON, bg='#FFF8DC').pack(side=tk.LEFT)
+        
+        # Disclaimer text
+        disclaimer_text = (
+            "This tool reduces your workload by automatically verifying references against academic databases.\n"
+            "ALL flagged references still require manual verification by you (the instructor).\n\n"
+            "Common legitimate reasons for flags: journal not indexed, honest student errors, recent publications"
+        )
+        tk.Label(disclaimer_frame, text=disclaimer_text, font=('Helvetica', 12), 
+                 bg='#FFF8DC', fg='#333333', justify=tk.LEFT, wraplength=700).pack(anchor=tk.W, pady=(8, 8))
+        
         # Input folder
         input_frame = tk.Frame(main_frame, bg=FT_WHITE)
         input_frame.pack(fill=tk.X, pady=10)
         tk.Label(input_frame, text="Papers Folder:", font=('Helvetica', 14), bg=FT_WHITE).pack(anchor=tk.W)
         input_row = tk.Frame(input_frame, bg=FT_WHITE)
         input_row.pack(fill=tk.X, pady=5)
-        tk.Entry(input_row, textvariable=self.input_folder, font=('Helvetica', 13), width=50).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Entry(input_row, textvariable=self.input_folder, font=('Helvetica', 13), width=50, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True)
         CrimsonButton(input_row, text="Browse", command=self.browse_input, font=('Helvetica', 13)).pack(side=tk.LEFT, padx=(10, 0))
         
         # Output file
@@ -1455,7 +2225,7 @@ class ReferenceCheckerGUI:
         tk.Label(output_frame, text="Save Report As:", font=('Helvetica', 14), bg=FT_WHITE).pack(anchor=tk.W)
         output_row = tk.Frame(output_frame, bg=FT_WHITE)
         output_row.pack(fill=tk.X, pady=5)
-        tk.Entry(output_row, textvariable=self.output_file, font=('Helvetica', 13), width=50).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Entry(output_row, textvariable=self.output_file, font=('Helvetica', 13), width=50, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True)
         CrimsonButton(output_row, text="Browse", command=self.browse_output, font=('Helvetica', 13)).pack(side=tk.LEFT, padx=(10, 0))
         
         # Thresholds
@@ -1474,8 +2244,11 @@ class ReferenceCheckerGUI:
         # Options
         options_frame = tk.Frame(main_frame, bg=FT_WHITE)
         options_frame.pack(fill=tk.X, pady=5)
-        tk.Checkbutton(options_frame, text="Ignore books/chapters (book verification accuracy is poor)",
+        tk.Checkbutton(options_frame, text="Ignore books/chapters (poor accuracy, many books must be manually verified)",
                        variable=self.ignore_books, font=('Helvetica', 13), bg=FT_WHITE,
+                       activebackground=FT_WHITE).pack(anchor=tk.W)
+        tk.Checkbutton(options_frame, text="Ignore websites (these must be manually verified)",
+                       variable=self.ignore_websites, font=('Helvetica', 13), bg=FT_WHITE,
                        activebackground=FT_WHITE).pack(anchor=tk.W)
         tk.Checkbutton(options_frame, text="Skip citation-reference matching",
                        variable=self.skip_citation_check, font=('Helvetica', 13), bg=FT_WHITE,
@@ -1558,13 +2331,14 @@ class ReferenceCheckerGUI:
         self.progress.start()
         
         ignore_books = self.ignore_books.get()
+        ignore_websites = self.ignore_websites.get()
         check_citations = not self.skip_citation_check.get()  # Inverted logic
         
         thread = threading.Thread(target=self.verification_worker,
-                                  args=(input_folder, output_file, verified_thresh, partial_thresh, ignore_books, check_citations))
+                                  args=(input_folder, output_file, verified_thresh, partial_thresh, ignore_books, ignore_websites, check_citations))
         thread.start()
     
-    def verification_worker(self, input_folder, output_file, verified_thresh, partial_thresh, ignore_books, check_citations):
+    def verification_worker(self, input_folder, output_file, verified_thresh, partial_thresh, ignore_books, ignore_websites, check_citations):
         try:
             self.update_status("Step 1/6: Reading papers...")
             lookup = ingest_papers(input_folder)
@@ -1592,18 +2366,29 @@ class ReferenceCheckerGUI:
             verified = verify_all_references(parsed, delay=0.3,
                                              verified_threshold=verified_thresh,
                                              partial_threshold=partial_thresh,
-                                             ignore_books=ignore_books)
+                                             ignore_books=ignore_books,
+                                             ignore_websites=ignore_websites)
             
             self.update_status(f"Step {6 + step_offset}/{6 + step_offset}: Generating report...")
             stats = generate_report(verified, output_file,
                                    verified_threshold=int(verified_thresh * 100),
                                    partial_threshold=int(partial_thresh * 100),
                                    ignore_books=ignore_books,
+                                   ignore_websites=ignore_websites,
                                    citation_results=citation_results)
             
-            self.root.after(0, lambda: self.show_results(stats, output_file, ignore_books, check_citations))
+            # Capture values before scheduling callback
+            final_stats = stats
+            final_output = output_file
+            final_ignore_books = ignore_books
+            final_check_citations = check_citations
+            
+            self.root.after(0, lambda: self.show_results(final_stats, final_output, final_ignore_books, final_check_citations))
+            self.root.after(0, lambda: messagebox.showinfo("Complete", f"Verification complete!\n\nReport saved to:\n{final_output}"))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"An error occurred: {str(e)}"))
+            import traceback
+            error_msg = f"An error occurred:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
         finally:
             self.root.after(0, self.verification_complete)
     
@@ -1611,142 +2396,11 @@ class ReferenceCheckerGUI:
         self.is_running = False
         self.run_btn.config(state=tk.NORMAL)
         self.progress.stop()
+        self.update_status("Verification complete!")
     
     def show_results(self, stats, output_file, ignore_books=False, check_citations=False):
-        self.update_status(f"Complete! Report saved to: {output_file}")
-        
-        verified_thresh = self.verified_threshold.get()
-        partial_thresh = self.partial_threshold.get()
-        
-        # Results title
-        results_title = tk.Label(self.results_frame, text="Results Summary",
-                                  font=('Helvetica', 18, 'bold'), fg=FT_CRIMSON, bg=FT_WHITE)
-        results_title.pack(anchor=tk.W, pady=(10, 5))
-        self.results_widgets.append(results_title)
-        
-        # Results border
-        results_border = tk.Frame(self.results_frame, bg=FT_CRIMSON, padx=2, pady=2)
-        results_border.pack(fill=tk.BOTH, expand=True)
-        self.results_widgets.append(results_border)
-        
-        # Canvas with scrollbar
-        canvas = tk.Canvas(results_border, bg=FT_LIGHT_GRAY, highlightthickness=0)
-        scrollbar = tk.Scrollbar(results_border, orient="vertical", command=canvas.yview)
-        table_frame = tk.Frame(canvas, bg=FT_LIGHT_GRAY, padx=20, pady=20)
-        
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        canvas_frame = canvas.create_window((0, 0), window=table_frame, anchor="nw")
-        
-        def configure_scroll(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(canvas_frame, width=event.width)
-        table_frame.bind("<Configure>", configure_scroll)
-        canvas.bind("<Configure>", configure_scroll)
-        
-        # Mouse wheel scrolling - works when hovering over results
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        def on_mousewheel_linux_up(event):
-            canvas.yview_scroll(-1, "units")
-        def on_mousewheel_linux_down(event):
-            canvas.yview_scroll(1, "units")
-        
-        # Bind to canvas and table_frame so it works anywhere in the results area
-        canvas.bind("<MouseWheel>", on_mousewheel)  # Windows/Mac
-        canvas.bind("<Button-4>", on_mousewheel_linux_up)  # Linux scroll up
-        canvas.bind("<Button-5>", on_mousewheel_linux_down)  # Linux scroll down
-        table_frame.bind("<MouseWheel>", on_mousewheel)  # Windows/Mac
-        table_frame.bind("<Button-4>", on_mousewheel_linux_up)  # Linux scroll up
-        table_frame.bind("<Button-5>", on_mousewheel_linux_down)  # Linux scroll down
-        
-        # Function to bind mousewheel to all child widgets recursively
-        def bind_mousewheel_recursive(widget):
-            widget.bind("<MouseWheel>", on_mousewheel)
-            widget.bind("<Button-4>", on_mousewheel_linux_up)
-            widget.bind("<Button-5>", on_mousewheel_linux_down)
-            for child in widget.winfo_children():
-                bind_mousewheel_recursive(child)
-        
-        # Summary section
-        tk.Label(table_frame, text="Summary", font=('Helvetica', 16, 'bold'),
-                 fg=FT_CRIMSON, bg=FT_LIGHT_GRAY).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 10))
-        
-        results_data = [
-            ("Total Papers:", str(stats['total_papers']), None),
-            ("Total References:", str(stats['total_refs']), None),
-            ("", "", None),
-            ("Verified:", str(stats['verified']), '#006600'),
-            ("No Match:", str(stats['no_match']), FT_CRIMSON if stats['no_match'] > 0 else None),
-            ("Partial Match:", str(stats['partial_match']), '#CC6600' if stats['partial_match'] > 0 else None),
-            ("DOI Mismatch:", str(stats['doi_mismatch']), FT_CRIMSON if stats['doi_mismatch'] > 0 else None),
-        ]
-        
-        if ignore_books:
-            results_data.append(("Books (Skipped):", str(stats.get('skipped', 0)), None))
-        else:
-            results_data.append(("Book (Manual):", str(stats['book_manual']), None))
-        
-        results_data.append(("Website (Manual):", str(stats['website_manual']), None))
-        
-        # Add citation matching stats if available
-        if check_citations and stats.get('citation_total_citations', 0) > 0:
-            results_data.extend([
-                ("", "", None),  # Spacer
-                ("In-Text Citations:", str(stats.get('citation_total_citations', 0)), None),
-                ("Reference Entries:", str(stats.get('citation_total_references', 0)), None),
-                ("Uncited References:", str(stats.get('citation_uncited', 0)), 
-                 '#CC6600' if stats.get('citation_uncited', 0) > 0 else None),
-                ("Missing References:", str(stats.get('citation_missing', 0)), 
-                 FT_CRIMSON if stats.get('citation_missing', 0) > 0 else None),
-            ])
-        
-        row_offset = 1
-        for i, (label, value, color) in enumerate(results_data):
-            if label == "":
-                tk.Frame(table_frame, height=10, bg=FT_LIGHT_GRAY).grid(row=i+row_offset, column=0, columnspan=2)
-                continue
-            tk.Label(table_frame, text=label, font=('Helvetica', 14), bg=FT_LIGHT_GRAY,
-                     anchor='w', width=20).grid(row=i+row_offset, column=0, sticky='w', pady=3)
-            tk.Label(table_frame, text=value, font=('Helvetica', 14, 'bold'), bg=FT_LIGHT_GRAY,
-                     fg=color or 'black', anchor='e', width=10).grid(row=i+row_offset, column=1, sticky='e', pady=3)
-        
-        # Legend
-        legend_row = len(results_data) + row_offset + 1
-        tk.Label(table_frame, text="Status Definitions", font=('Helvetica', 16, 'bold'),
-                 fg=FT_CRIMSON, bg=FT_LIGHT_GRAY).grid(row=legend_row, column=0, columnspan=2, sticky='w', pady=(20, 10))
-        
-        legend_items = [
-            ("Verified", f"Reference found with ≥{verified_thresh}% title match"),
-            ("No Match", "Reference not found - may be fabricated"),
-            ("Partial Match", f"Similar reference found ({partial_thresh}-{verified_thresh}% match)"),
-            ("DOI Mismatch", "DOI links to a different paper"),
-        ]
-        
-        if ignore_books:
-            legend_items.append(("Skipped", "Book/chapter skipped per settings"))
-        else:
-            legend_items.append(("Book (Manual)", "Book/chapter - verify manually"))
-        
-        legend_items.append(("Website (Manual)", "Website source - verify manually"))
-        
-        for i, (term, definition) in enumerate(legend_items):
-            tk.Label(table_frame, text=f"{term}:", font=('Helvetica', 12, 'bold'),
-                     bg=FT_LIGHT_GRAY, anchor='w').grid(row=legend_row+1+i, column=0, sticky='nw', pady=2)
-            tk.Label(table_frame, text=definition, font=('Helvetica', 12), bg=FT_LIGHT_GRAY,
-                     anchor='w', wraplength=350, justify=tk.LEFT).grid(row=legend_row+1+i, column=1, sticky='w', pady=2)
-        
-        # Path
-        path_row = legend_row + len(legend_items) + 2
-        tk.Label(table_frame, text=f"Report saved to:\n{output_file}", font=('Helvetica', 11),
-                 bg=FT_LIGHT_GRAY, fg='#666666', wraplength=450, justify=tk.LEFT).grid(
-                     row=path_row, column=0, columnspan=2, sticky='w', pady=(20, 0))
-        
-        # Apply mousewheel bindings to all child widgets so scrolling works everywhere
-        bind_mousewheel_recursive(table_frame)
-        
-        messagebox.showinfo("Complete", "Report complete.")
+        """Display results summary - removed to avoid duplication with report."""
+        pass
 
 
 def main():
