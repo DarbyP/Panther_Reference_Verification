@@ -4,7 +4,7 @@ A tool to detect potentially fabricated references in student papers. Developed 
 
 ## Features
 
-- **References and citations must be in APA style**
+- **References and citations must be in APA or MLA style**: However, MLA style has more variation so the tool makes more errors with MLA style
 - **Reference Verification**: Checks references against CrossRef, PubMed (journals), Open Library, and Google Books (books)
 - **Citation-Reference Matching**: Verifies that in-text citations match reference list entries
 - **Detailed Reports**: Generates Word documents with color-coded verification status
